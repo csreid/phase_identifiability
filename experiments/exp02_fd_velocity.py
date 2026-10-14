@@ -55,6 +55,10 @@ def parse():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--val-every", type=int, default=5)
+    p.add_argument(
+        "--fig-every", type=int, default=1,
+        help="log the val/fd figure every N epochs (cheap; no MLP probes)",
+    )
     p.add_argument("--out", type=str, default="runs/exp02")
     return p.parse_args()
 
@@ -120,15 +124,28 @@ def fd_figure(q, states):
     return fig
 
 
-def evaluate(writer, enc, eval_ds, dev, step, args, final=False):
-    q = embed_rollouts(enc, eval_ds, dev, args.normalize)
-    states = eval_ds.states.numpy()
-    rep = fd_report(q, states)
-    log_report(writer, rep, step, "final" if final else "probe")
+def log_figure(writer, q, states, step):
     if q.shape[-1] == 2:
         fig = fd_figure(q, states)
         writer.add_figure("val/fd", fig, step)
         plt.close(fig)
+
+
+def snapshot(writer, enc, eval_ds, dev, step, args):
+    """Cheap per-epoch view: embed eval frames and log only the figure."""
+    q = embed_rollouts(enc, eval_ds, dev, args.normalize)
+    log_figure(writer, q, eval_ds.states.numpy(), step)
+
+
+def evaluate(writer, enc, eval_ds, dev, step, args, final=False):
+    """Full probe report (incl. MLP probes). The figure is logged here only
+    for the final pass; during training ``--fig-every`` handles it."""
+    q = embed_rollouts(enc, eval_ds, dev, args.normalize)
+    states = eval_ds.states.numpy()
+    rep = fd_report(q, states)
+    log_report(writer, rep, step, "final" if final else "probe")
+    if final and args.fig_every <= 0:
+        log_figure(writer, q, states, step)
     return q, rep
 
 
@@ -142,6 +159,8 @@ def train(args, ds, eval_ds, seed, dev, writer):
     )
     g = torch.Generator().manual_seed(seed)
     step = 0
+    if args.fig_every > 0:
+        snapshot(writer, enc, eval_ds, dev, 0, args)  # untrained reference
     for ep in range(args.epochs):
         enc.train()
         perm = torch.randperm(len(ds), generator=g)
@@ -159,13 +178,19 @@ def train(args, ds, eval_ds, seed, dev, writer):
             tot, nb, step = tot + loss.item(), nb + 1, step + 1
             if step % 20 == 0:
                 writer.add_scalar("train/loss_step", loss.item(), step)
-        writer.add_scalar("train/loss", tot / nb, ep)
-        writer.add_scalar("train/lr", sched.get_last_lr()[0], ep)
+        # TB step = epochs completed (0 = untrained), same for all tags
+        done = ep + 1
+        writer.add_scalar("train/loss", tot / nb, done)
+        writer.add_scalar("train/lr", sched.get_last_lr()[0], done)
+        if args.fig_every > 0 and (
+            done % args.fig_every == 0 or done == args.epochs
+        ):
+            snapshot(writer, enc, eval_ds, dev, done, args)
         msg = f"  seed {seed} ep {ep:3d} loss {tot / nb:.4f}"
         if args.val_every > 0 and (
             (ep + 1) % args.val_every == 0 or ep == args.epochs - 1
         ):
-            _, rep = evaluate(writer, enc, eval_ds, dev, ep, args)
+            _, rep = evaluate(writer, enc, eval_ds, dev, done, args)
             msg += (
                 f"  ang_err {rep.get('pos/angle_err_rad', float('nan')):.3f}"
                 f"  dphi->thd {rep.get('vel/dphi->thd linear', float('nan')):.3f}"

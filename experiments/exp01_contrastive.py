@@ -12,15 +12,24 @@ import json
 import sys
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from phase_id.data import WindowPairs
 from phase_id.env import collect_seeded_random_rollouts
 from phase_id.losses import info_nce
-from phase_id.metrics import cross_seed_consistency, identifiability_report
+from phase_id.metrics import (
+    cross_seed_consistency,
+    hamiltonian,
+    identifiability_report,
+)
 from phase_id.models import ActionPredictor, Encoder
 
 
@@ -40,6 +49,7 @@ def parse():
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seeds", type=int, default=5)
+    p.add_argument("--val-every", type=int, default=5)
     p.add_argument("--out", type=str, default="runs/exp01")
     return p.parse_args()
 
@@ -54,7 +64,26 @@ def embed(enc, ds, dev):
     return torch.cat(zs).numpy(), torch.cat(ss).numpy()
 
 
-def train(args, ds, seed, dev):
+def log_report(writer, rep, step, prefix="probe"):
+    for k, v in rep.items():
+        writer.add_scalar(f"{prefix}/{k}", v, step)
+
+
+def evaluate(writer, enc, eval_ds, dev, step, args, final=False):
+    z, states = embed(enc, eval_ds, dev)
+    rep = identifiability_report(z, states)
+    log_report(writer, rep, step, "final" if final else "probe")
+    writer.add_histogram("val/z", z, step)
+    for d in range(z.shape[1]):
+        writer.add_scalar(f"val/z_std/dim{d}", float(z[:, d].std()), step)
+    if z.shape[1] >= 2:
+        fig = latent_figure(z, states)
+        writer.add_figure("val/latent", fig, step)
+        plt.close(fig)
+    return z, states, rep
+
+
+def train(args, ds, eval_ds, seed, dev, writer):
     torch.manual_seed(seed)
     enc = Encoder(3 * args.window, args.dim).to(dev)
     pred = ActionPredictor(args.dim, args.k).to(dev) if args.action_cond else None
@@ -66,6 +95,7 @@ def train(args, ds, seed, dev):
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
 
     g = torch.Generator().manual_seed(seed)
+    step = 0
     for ep in range(args.epochs):
         enc.train()
         perm = torch.randperm(len(ds), generator=g)
@@ -80,31 +110,54 @@ def train(args, ds, seed, dev):
             loss.backward()
             opt.step()
             sched.step()
-            tot, nb = tot + loss.item(), nb + 1
-        if ep % 5 == 0 or ep == args.epochs - 1:
-            print(f"  seed {seed} ep {ep:3d} loss {tot / nb:.4f}", flush=True)
+            tot, nb, step = tot + loss.item(), nb + 1, step + 1
+            if step % 20 == 0:
+                writer.add_scalar("train/loss_step", loss.item(), step)
+        writer.add_scalar("train/loss", tot / nb, ep)
+        writer.add_scalar("train/lr", sched.get_last_lr()[0], ep)
+        msg = f"  seed {seed} ep {ep:3d} loss {tot / nb:.4f}"
+        if args.val_every > 0 and (
+            (ep + 1) % args.val_every == 0 or ep == args.epochs - 1
+        ):
+            _, _, rep = evaluate(writer, enc, eval_ds, dev, ep, args)
+            msg += (
+                f"  z->s {rep['z->s mlp']:.3f}"
+                f"  z->H {rep['z->H mlp']:.3f}"
+                f"  z->thd {rep['z->theta_dot mlp']:.3f}"
+                f"  rank {rep['eff_rank']:.2f}"
+            )
+        print(msg, flush=True)
     return enc
 
 
-def scatter(z, states, path):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+def latent_figure(z, states):
+    """z (first two dims) colored by theta, theta_dot, and H."""
     theta = np.arctan2(states[:, 1], states[:, 0])
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4.5))
-    for a, c, name, cmap in [
-        (ax[0], theta, "theta", "twilight"),
-        (ax[1], states[:, 2], "theta_dot", "coolwarm"),
-    ]:
+    panels = [
+        (theta, "theta", "twilight"),
+        (states[:, 2], "theta_dot", "coolwarm"),
+        (hamiltonian(states)[:, 0], "H", "viridis"),
+    ]
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.5))
+    for a, (c, name, cmap) in zip(ax, panels):
         im = a.scatter(z[:, 0], z[:, 1], c=c, s=2, cmap=cmap)
         a.set_title(f"z colored by {name}")
         a.set_aspect("equal", "datalim")
         fig.colorbar(im, ax=a)
     fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
+    return fig
+
+
+def coverage_figure(ds):
+    st = ds.states.reshape(-1, 3).numpy()
+    theta = np.arctan2(st[:, 1], st[:, 0])
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(theta, st[:, 2], s=2, alpha=0.25, linewidths=0)
+    ax.set_xlabel("theta (rad)")
+    ax.set_ylabel("theta_dot (rad/s)")
+    ax.set_title(f"Training phase-space coverage (N={len(st):,})")
+    fig.tight_layout()
+    return fig
 
 
 def main():
@@ -128,32 +181,55 @@ def main():
     )
     print(f"train pairs {len(train_ds)}  eval windows {len(eval_ds)}")
 
+    summary = SummaryWriter(out / "tb" / "summary")
+    summary.add_text("args", "```\n" + json.dumps(vars(args), indent=2) + "\n```")
+    fig = coverage_figure(train_ds)
+    summary.add_figure("data/phase_space_coverage", fig, 0)
+    plt.close(fig)
+
     # Floor: untrained encoder.
     torch.manual_seed(999)
     rand_enc = Encoder(3 * args.window, args.dim).to(dev)
     rand_enc(train_ds.batch(torch.arange(2))["x"].to(dev))
     z0, states = embed(rand_enc, eval_ds, dev)
-    results = {"random_init": identifiability_report(z0, states)}
-    # Ceiling: raw state -> state is trivially 1.0; report for reference only.
-    print("random-init floor:", results["random_init"])
+    floor = identifiability_report(z0, states)
+    results = {"random_init": floor}
+    log_report(summary, floor, 0, "random_init")
+    print("random-init floor:", {k: round(v, 3) for k, v in floor.items()})
 
     zs = []
     for seed in range(args.seeds):
-        enc = train(args, train_ds, seed, dev)
-        z, states = embed(enc, eval_ds, dev)
+        writer = SummaryWriter(out / "tb" / f"seed{seed}")
+        enc = train(args, train_ds, eval_ds, seed, dev, writer)
+        z, states, rep = evaluate(
+            writer, enc, eval_ds, dev, args.epochs, args, final=True
+        )
         zs.append(z)
-        rep = identifiability_report(z, states)
         results[f"seed{seed}"] = rep
         print(f"seed {seed}:", {k: round(v, 3) for k, v in rep.items()})
-        if args.dim == 2:
-            scatter(z, states, out / f"latent_seed{seed}.png")
+        writer.close()
 
     if len(zs) > 1:
-        results["cross_seed"] = cross_seed_consistency(zs)
-        print("cross-seed R^2:", results["cross_seed"])
+        cs = cross_seed_consistency(zs)
+        results["cross_seed"] = cs
+        for k, v in cs.items():
+            summary.add_scalar(f"cross_seed/{k}", v, 0)
+        print("cross-seed R^2:", cs)
+
+    keys = [k for k in floor if k != "H->z mlp"]
+    mean_final = {
+        k: float(np.mean([results[f"seed{i}"][k] for i in range(args.seeds)]))
+        for k in keys
+    }
+    hp = {k: v for k, v in vars(args).items() if k != "out"}
+    summary.add_hparams(
+        hp, {f"hparam/{k}": v for k, v in mean_final.items()}, run_name="."
+    )
+    summary.close()
 
     (out / "results.json").write_text(json.dumps(results, indent=2))
     print(f"wrote {out / 'results.json'}")
+    print(f"tensorboard --logdir {out / 'tb'}")
 
 
 if __name__ == "__main__":

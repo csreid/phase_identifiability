@@ -77,6 +77,11 @@ def fd_report(q: np.ndarray, states: np.ndarray, mlp: bool = True) -> dict:
         err, s, _ = circle_align(phi[:, 1:-1].ravel(), theta[:, 1:-1].ravel())
         out["pos/angle_err_rad"] = err
         out["pos/orientation"] = s
+        # Closure: a full S^1 embedding has no big empty gap in phi.
+        ps = np.sort(phi[:, 1:-1].ravel())
+        gaps = np.diff(np.append(ps, ps[0] + 2 * np.pi))
+        out["pos/max_gap_rad"] = float(gaps.max())
+        out["pos/arc_extent_rad"] = float(2 * np.pi - gaps.max())
         dphi = s * angle_velocity(phi).reshape(-1, 1)
         out["vel/dphi->thd linear"] = linear_r2(dphi, thd)
         out["vel/dphi_slope"] = float((dphi * thd).sum() / (dphi**2).sum())

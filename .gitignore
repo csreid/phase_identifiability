@@ -1,0 +1,5 @@
+runs/
+*.pt
+*.png
+__pycache__/
+.venv/
